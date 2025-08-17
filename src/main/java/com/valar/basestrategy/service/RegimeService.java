@@ -4,101 +4,118 @@ import com.valar.basestrategy.entities.indicators.RegimeDetector;
 import com.valar.basestrategy.entities.indicators.RegimeDetector.Regime;
 import com.valar.basestrategy.state.minute.IndexState;
 import com.valar.basestrategy.utils.DayIterator;
+import com.valar.basestrategy.utils.DayIterator.Row;
 import com.valar.basestrategy.utils.RegimeWriter;
 
-import java.io.BufferedWriter;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.*;
 import java.time.LocalDate;
 import java.util.ArrayDeque;
 import java.util.Deque;
-import java.util.List;
+
+import static com.valar.basestrategy.application.PropertiesReader.properties;
 
 public class RegimeService {
 
-    private final DayIterator dayIter;
+    private final DayIterator bnIter;     // BankNifty (main)
+    private final DayIterator nfIter;     // NIFTY (benchmark)
     private final RegimeDetector detector;
-    private final Deque<Double> atrQ = new ArrayDeque<>(10);
-    private final Deque<Double> adxQ = new ArrayDeque<>(10);
-    private final Deque<Double> retQ = new ArrayDeque<>(10);
-    private final Deque<Double> bRetQ= new ArrayDeque<>(10);
-    private Double prevClose = null;
-    private LocalDate currentDay = null;
 
-    private final Path debugPath;
-    private final BufferedWriter dbg;
+    // Windows
+    private final Deque<Double> priceQ;   //to calc T
+    private final Deque<Double> retQ;     // to calc V
+    private final Deque<Double> corrRetQ; // to calcC
+    private final Deque<Double> benchRetQ;// to calc C
 
-    public RegimeService(DayIterator iter, RegimeDetector detector) throws IOException {
-        this.dayIter = iter; this.detector = detector;
-        this.debugPath = Paths.get("Outputs/RegimeDebug.log");
-        Files.createDirectories(debugPath.getParent());
-        this.dbg = Files.newBufferedWriter(debugPath, StandardCharsets.UTF_8,
-                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-        dbg.write("[INIT] " + dayIter.info()); dbg.newLine(); dbg.flush();
+    private Double prevCloseBN = null;
+    private Double prevCloseNF = null;
+
+    private final boolean debug = Boolean.parseBoolean(properties.getProperty("regimeDebug", "false"));
+
+    public RegimeService(DayIterator bnIter, DayIterator nfIter, RegimeDetector detector) {
+        this.bnIter = bnIter;
+        this.nfIter = nfIter;
+        this.detector = detector;
+        int n = detector.windowN();
+        this.priceQ   = new ArrayDeque<>(n);
+        this.retQ     = new ArrayDeque<>(n);
+        this.corrRetQ = new ArrayDeque<>(n);
+        this.benchRetQ= new ArrayDeque<>(n);
     }
 
-    /** Call once at startup with the first minute date to pre-fill the 10-day window. */
-    public void preWarm(LocalDate firstMinuteDate) {
-        ensureWindowReady(firstMinuteDate);
-        try {
-            dbg.write(String.format("[PREWARM] minute=%s atrQ=%d adxQ=%d retQ=%d%n",
-                    firstMinuteDate, atrQ.size(), adxQ.size(), retQ.size()));
-            dbg.flush();
-        } catch (IOException ignore) {}
-    }
+    // Computes regime at the start of each matched day using "previous N days".
 
-    private void ensureWindowReady(LocalDate minuteDate) {
-        List<DayIterator.Row> prior = dayIter.advanceAllToPreviousOf(minuteDate);
-        // If we didn't get enough history (e.g., iterator was at the end), rewind and try again
-        if (prior.isEmpty() && atrQ.size() < 10) {
-            dayIter.rewind();
-            prior = dayIter.advanceAllToPreviousOf(minuteDate);
-        }
-        for (DayIterator.Row r : prior) {
-            // If ATR looks like points (tiny), convert to %
-            double atr = r.atr14;
-            if (atr > 0 && atr < 5 && r.close > 0) atr = (atr / r.close) * 100.0;
-            // If ADX is on 0..1 scale, convert to 0..100
-            double adx = (r.adx14 <= 3.0 ? r.adx14 * 100.0 : r.adx14);
+    public void writeAllHistory(RegimeWriter out) {
+        LocalDate dBN = bnIter.peekNextDate();
+        LocalDate dNF = nfIter.peekNextDate();
 
-            push(atrQ, atr);
-            push(adxQ, adx);
-            if (prevClose != null) {
-                double rr = (r.close - prevClose) / (prevClose == 0.0 ? 1.0 : prevClose);
-                push(retQ, rr);
+        while (dBN != null && dNF != null) {
+            int cmp = dBN.compareTo(dNF);
+
+            if (cmp < 0) { // BN earlier → advance BF cursor
+                Row rBN = bnIter.poll();
+                pushPrice(rBN.close);
+                if (prevCloseBN != null) pushRet(RegimeDetector.dailyReturn(prevCloseBN, rBN.close));
+                prevCloseBN = rBN.close;
+                dBN = bnIter.peekNextDate();
+
+            } else if (cmp > 0) { // NF earlier → advance NF cursor
+                Row rNF = nfIter.poll();
+                prevCloseNF = rNF.close;
+                dNF = nfIter.peekNextDate();
+
+            } else { // matched date
+                Row rBN = bnIter.poll();
+                Row rNF = nfIter.poll();
+
+                // compute from previous N days (today NOT yet in window)
+                int n = detector.windowN();
+                Regime regime = (priceQ.size() >= n && retQ.size() >= n)
+                        ? detector.compute(priceQ, retQ, corrRetQ, benchRetQ)
+                        : null;
+
+                try {
+                    if (regime == null) {
+                        out.append(rBN.date.toString(), -1, "Null", -1, -1, -1, -1);
+                        if (debug) System.out.println("[Regime SOD] " + rBN.date + " -> Null");
+                    } else {
+                        int code = regime.code;
+                        int V =  code % 2;
+                        int T = (code / 2) % 2;
+                        int C = (code / 4) % 2;
+                        out.append(rBN.date.toString(), code, regime.label, C, T, V, code);
+                        if (debug) System.out.println("[Regime SOD] " + rBN.date + " -> code=" + code + " C="+C+" T="+T+" V="+V);
+                    }
+                } catch (Exception ignore) {}
+
+                // add today's data for tomorrow's regime calc
+                pushPrice(rBN.close);
+                Double rrBN = (prevCloseBN == null) ? null : RegimeDetector.dailyReturn(prevCloseBN, rBN.close);
+                if (rrBN != null) pushRet(rrBN);
+                prevCloseBN = rBN.close;
+
+                Double rrNF = (prevCloseNF == null) ? null : RegimeDetector.dailyReturn(prevCloseNF, rNF.close);
+                prevCloseNF = rNF.close;
+                if (rrBN != null && rrNF != null) { pushCorrBN(rrBN); pushBenchNF(rrNF); }
+
+                dBN = bnIter.peekNextDate();
+                dNF = nfIter.peekNextDate();
             }
-            prevClose = r.close;
         }
-        try {
-            dbg.write(String.format("[FILL] %s prior=%d atrQ=%d adxQ=%d retQ=%d lastATR=%.6f lastADX=%.6f%n",
-                    minuteDate, prior.size(), atrQ.size(), adxQ.size(), retQ.size(),
-                    atrQ.isEmpty()?Double.NaN:atrQ.getLast(),
-                    adxQ.isEmpty()?Double.NaN:adxQ.getLast()));
-            dbg.flush();
-        } catch (IOException ignore) {}
+        if (debug) System.out.println("[Regime] writeAllHistory finished.");
     }
-
-    /** Call once at the first minute of each trading day. */
-    public void onMinute(LocalDate minuteDate, IndexState state, RegimeWriter out) throws IOException {
-        if (currentDay != null && minuteDate.equals(currentDay)) return;
-
-        ensureWindowReady(minuteDate);
-
-        Regime regime = null;
-        if (detector.warmupReady(atrQ, adxQ)) {
-            regime = detector.compute(atrQ, adxQ, retQ, bRetQ);
-        }
-
-        try {
-            dbg.write(String.format("[DAY] %s regime=%s%n", minuteDate, regime==null?"Null":regime.name()));
-            dbg.flush();
-        } catch (IOException ignore) {}
-
-        state.setTodayRegime(regime);
-        out.append(minuteDate.toString(), regime==null ? -1 : regime.code, regime==null ? "Null" : regime.label);
-        currentDay = minuteDate;
+    private void pushPrice(double v) {
+        if (priceQ.size()==detector.windowN()) priceQ.removeFirst();
+        priceQ.addLast(v);
     }
-
-    private static void push(Deque<Double> q, double v){ if (q.size()==10) q.removeFirst(); q.addLast(v); }
+    private void pushRet(double v) {
+        if (retQ.size()==detector.windowN()) retQ.removeFirst();
+        retQ.addLast(v);
+    }
+    private void pushCorrBN(double v){
+        if (corrRetQ.size()==detector.windowN()) corrRetQ.removeFirst();
+        corrRetQ.addLast(v);
+    }
+    private void pushBenchNF(double v){
+        if (benchRetQ.size()==detector.windowN()) benchRetQ.removeFirst();
+        benchRetQ.addLast(v);
+    }
 }

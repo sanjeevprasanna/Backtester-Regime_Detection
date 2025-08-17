@@ -2,6 +2,7 @@ package com.valar.basestrategy.service;
 
 import com.valar.basestrategy.entities.Ohlc;
 import com.valar.basestrategy.entities.TradeEntity;
+import com.valar.basestrategy.entities.indicators.RegimeDetector;
 import com.valar.basestrategy.state.minute.IndexState;
 import com.valar.basestrategy.state.minute.State;
 import com.valar.basestrategy.tradeAndDayMetrics.DayMetric;
@@ -10,15 +11,12 @@ import com.valar.basestrategy.utils.KeyValues;
 import com.valar.basestrategy.utils.RegimeWriter;
 import org.ta4j.core.Bar;
 
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.time.DayOfWeek;
-import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 
-import static java.lang.Math.max;
+import static com.valar.basestrategy.application.PropertiesReader.properties;
 
 public class StrategyImpl {
     private int tradeId;
@@ -63,14 +61,25 @@ public class StrategyImpl {
         this.candlePeriodBelongsToDay = candlePeriodBelongsToDay;
 
         try {
-            Path outCsv = Paths.get("Outputs/RegimeByDay.csv");
-            DayIterator dayIter = new DayIterator();
-            this.regimeSvc = new RegimeService(dayIter, new com.valar.basestrategy.entities.indicators.RegimeDetector());
-            this.regimeWriter = new RegimeWriter(outCsv.toString());
+            String outPath = properties.getProperty("regimeOutputPath");
+            String bnPath  = properties.getProperty("regimeDayPath");
+            String nfPath  = properties.getProperty("regimeBenchmarkDayPath");
+            if (bnPath == null || nfPath == null) throw new IllegalArgumentException("Missing regimeDayPath or regimeBenchmarkDayPath");
 
-            // Pre-warm the 10-day window using the very first minute's date
-            LocalDate firstMinuteDate = LocalDate.parse(indexState.ohlc.date, DAY_FMT_MIN);
-            regimeSvc.preWarm(firstMinuteDate);
+            DayIterator bnIter = new DayIterator(bnPath);
+            DayIterator nfIter = new DayIterator(nfPath);
+
+            int windowN       = Integer.parseInt(properties.getProperty("regimeWindowN"));
+            double volThr  = Double.parseDouble(properties.getProperty("regimeVolThreshold"));
+            double corrThr = Double.parseDouble(properties.getProperty("regimeCorrThreshold"));
+
+            RegimeDetector detector = new RegimeDetector(windowN, volThr, corrThr);
+
+            this.regimeSvc    = new RegimeService(bnIter, nfIter, detector);
+            this.regimeWriter = new RegimeWriter(outPath);
+
+            // Produce regimes for the full history up-front
+            regimeSvc.writeAllHistory(regimeWriter);
         } catch (Exception e) {
             throw new RuntimeException("Regime init failed", e);
         }
@@ -81,14 +90,7 @@ public class StrategyImpl {
     public void iterate(int mins) {
         String currDate = indexState.ohlc.date;
 
-        // compute regime exactly once per new day
-        if (prevDate == null || !prevDate.equals(currDate)) {
-            try {
-                regimeSvc.onMinute(LocalDate.parse(currDate, DAY_FMT_MIN), (IndexState) indexState, regimeWriter);
-            } catch (Exception e) {
-                throw new RuntimeException("Regime onMinute failed for " + currDate, e);
-            }
-        }
+        // NOTE: we already wrote all regimes in the constructor. No per-day regime write here.
 
         // pivots on day change
         if (prevDate != null && !prevDate.equals(currDate)) {
@@ -187,13 +189,8 @@ public class StrategyImpl {
             boolean forceExit = (barDateTime.getDayOfWeek() == DayOfWeek.THURSDAY && bar.mins >= (15 * 60 + 15));
             boolean hitSL = false, hitTarget = false;
 
-            if (lOrS == 'l') {
-                hitSL = (bar.low <= tradeEntity.stopLoss);
-                hitTarget = (bar.high >= tradeEntity.target);
-            } else if (lOrS == 's') {
-                hitSL = (bar.high >= tradeEntity.stopLoss);
-                hitTarget = (bar.low <= tradeEntity.target);
-            }
+            if (lOrS == 'l') { hitSL = (bar.low <= tradeEntity.stopLoss); hitTarget = (bar.high >= tradeEntity.target); }
+            else if (lOrS == 's') { hitSL = (bar.high >= tradeEntity.stopLoss); hitTarget = (bar.low <= tradeEntity.target); }
 
             if (hitSL) { tradeEntity.exit("StopLoss", "SL-hit"); onTradeExit(bar.date, tradeEntity); }
             else if (hitTarget) { tradeEntity.exit("Target", "TP-hit"); onTradeExit(bar.date, tradeEntity); }

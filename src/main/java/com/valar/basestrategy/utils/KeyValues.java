@@ -23,6 +23,9 @@ public class KeyValues {
     public final boolean usePivots ;
     public final int rsiLong,rsiShort;
     private boolean useRegime = false;
+    private final int regimeWindow;
+    private final double regimeVolThreshold;
+    private final double regimeCorrThreshold;
 
     public KeyValues(String ln) {
         this.ln = ln;
@@ -45,6 +48,9 @@ public class KeyValues {
         rsiLong = Integer.parseInt(splits[iter++]);
         rsiShort = Integer.parseInt(splits[iter++]);
         useRegime = Boolean.parseBoolean(splits[iter++]);
+        regimeWindow = Integer.parseInt(splits[iter++]);
+        regimeVolThreshold = Double.parseDouble(splits[iter++]);
+        regimeCorrThreshold = Double.parseDouble(splits[iter++]);
     }
 
     public static List<String> getTimeFrames(int timeFrame) {
@@ -131,6 +137,8 @@ public class KeyValues {
 //        listOfFiles = getAllFilesOfFolder("");
     }
     public boolean isUseRegime(){ return useRegime; }
-    public void setUseRegime(boolean v){ this.useRegime = v; }
+    public int getRegimeWindow(){ return regimeWindow; }
+    public double getRegimeVolThreshold(){ return regimeVolThreshold; }
+    public double getRegimeCorrThreshold(){ return regimeCorrThreshold; }
 
 }
